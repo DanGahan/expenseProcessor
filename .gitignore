@@ -1,0 +1,19 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Receipts and output
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.xlsx
+expenses.csv
+wc */
+
+# macOS
+.DS_Store
