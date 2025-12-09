@@ -222,16 +222,17 @@ def parse_date(text):
 def parse_cost(text):
     """Extract cost from receipt text"""
     # First, try to find explicit total amount patterns
+    # IMPORTANT: Use word boundaries to avoid matching "Subtotal" when looking for "Total"
     total_patterns = [
         r'Total[:\s]+amount[:\s]*£?\s*(\d+[.,]\d{2})',
-        r'Total[:\s]*£?\s*(\d+[.,]\d{2})',
-        r'Tot¥1[:\s]*£?\s*(\d+[.,]\d{2})',  # OCR error: Total -> Tot¥1
-        r'Subtotal[:\s]*\n?\s*[^\d\n]*?(\d+)\s*[.,]\s*(\d{2})',  # Subtotal with garbled text
-        r'Subtotal[:\s]*£?\s*(\d+[.,]\d{2})',
         r'Grand[:\s]+Total[:\s]*£?\s*(\d+[.,]\d{2})',
+        r'\bTotal[:\s]*£?\s*(\d+[.,]\d{2})',  # Word boundary to avoid "Subtotal"
+        r'Tot¥1[:\s]*£?\s*(\d+[.,]\d{2})',  # OCR error: Total -> Tot¥1
         r'Amount[:\s]+Due[:\s]*£?\s*(\d+[.,]\d{2})',
         r'Balance[:\s]+Due[:\s]*£?\s*(\d+[.,]\d{2})',
         r'Balanc•[:\s]*£?\s*(\d+[.,]\d{2})',  # OCR error: Balance -> Balanc•
+        r'Subtotal[:\s]*\n?\s*[^\d\n]*?(\d+)\s*[.,]\s*(\d{2})',  # Subtotal with garbled text (last resort)
+        r'Subtotal[:\s]*£?\s*(\d+[.,]\d{2})',  # Subtotal (last resort)
     ]
 
     for pattern in total_patterns:
