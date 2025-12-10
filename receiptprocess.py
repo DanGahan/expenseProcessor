@@ -17,6 +17,162 @@ except ImportError:
     print("Error: This script requires pyobjc. Install with: pip3 install pyobjc-framework-Quartz pyobjc-framework-Vision")
     sys.exit(1)
 
+# Import OpenCV and numpy for preprocessing
+try:
+    import cv2
+    import numpy as np
+    PREPROCESSING_AVAILABLE = True
+except ImportError:
+    PREPROCESSING_AVAILABLE = False
+    print("Warning: OpenCV not available. Install with: pip3 install opencv-python numpy")
+    print("         Running without image preprocessing.")
+
+
+def upscale_image(img, target_width=1000, target_height=1000):
+    """Upscale low-resolution images to ensure sufficient detail for OCR"""
+    height, width = img.shape[:2]
+
+    # If image is too small, scale up
+    if width < target_width or height < target_height:
+        scale_factor = max(target_width/width, target_height/height)
+        new_width = int(width * scale_factor)
+        new_height = int(height * scale_factor)
+        return cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+
+    return img
+
+
+def denoise_image(img):
+    """Remove noise from image using Non-local Means Denoising"""
+    # For color images
+    if len(img.shape) == 3:
+        return cv2.fastNlMeansDenoisingColored(img, None, 10, 10, 7, 15)
+    # For grayscale
+    else:
+        return cv2.fastNlMeansDenoising(img, None, 10, 7, 21)
+
+
+def deskew_image(img):
+    """Automatically detect and correct image skew"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+
+    # Use Canny edge detection
+    edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+
+    # Detect lines using Hough transform
+    lines = cv2.HoughLinesP(edges, 1, np.pi/180, 100, minLineLength=100, maxLineGap=10)
+
+    if lines is not None and len(lines) > 0:
+        # Calculate median angle from detected lines
+        angles = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+            # Normalize angles to -45 to 45 range
+            if angle < -45:
+                angle += 90
+            elif angle > 45:
+                angle -= 90
+            angles.append(angle)
+
+        median_angle = np.median(angles)
+
+        # Only rotate if skew is significant (more than 0.5 degrees)
+        if abs(median_angle) > 0.5:
+            # Rotate image
+            (h, w) = img.shape[:2]
+            center = (w // 2, h // 2)
+            M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+            rotated = cv2.warpAffine(img, M, (w, h),
+                                      flags=cv2.INTER_CUBIC,
+                                      borderMode=cv2.BORDER_REPLICATE)
+            return rotated
+
+    return img
+
+
+def enhance_contrast(img):
+    """Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    enhanced = clahe.apply(gray)
+
+    # Convert back to color if input was color
+    if len(img.shape) == 3:
+        return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    return enhanced
+
+
+def sharpen_image(img):
+    """Sharpen image to enhance text edges"""
+    kernel = np.array([[-1,-1,-1],
+                       [-1, 9,-1],
+                       [-1,-1,-1]])
+    return cv2.filter2D(img, -1, kernel)
+
+
+def binarize_image(img):
+    """Convert to binary (black and white) using adaptive thresholding"""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if len(img.shape) == 3 else img
+
+    # Adaptive thresholding works better for receipts with varying lighting
+    binary = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        11, 2
+    )
+
+    # Convert back to BGR for consistency
+    return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+
+def preprocess_image(image_path):
+    """
+    Complete preprocessing pipeline for receipt images.
+
+    Applies the following steps in order:
+    1. Upscale if needed (ensures sufficient resolution)
+    2. Denoise (remove camera noise)
+    3. Deskew (straighten the image)
+    4. Enhance contrast (make text stand out)
+    5. Sharpen (crisp up edges)
+
+    Note: Binarization is skipped as Apple Vision Framework handles
+    grayscale images better than binary images.
+
+    Returns path to preprocessed image, or original path if preprocessing fails.
+    """
+    if not PREPROCESSING_AVAILABLE:
+        return image_path
+
+    try:
+        # Load image
+        img = cv2.imread(image_path)
+
+        if img is None:
+            print(f"    Warning: Could not load image for preprocessing: {image_path}")
+            return image_path
+
+        # Apply preprocessing steps
+        img = upscale_image(img)
+        img = denoise_image(img)
+        img = deskew_image(img)
+        img = enhance_contrast(img)
+        img = sharpen_image(img)
+
+        # Save preprocessed image to temp file
+        base, ext = os.path.splitext(image_path)
+        temp_path = f"{base}_preprocessed{ext}"
+        cv2.imwrite(temp_path, img)
+
+        return temp_path
+
+    except Exception as e:
+        print(f"    Warning: Preprocessing failed: {e}")
+        print(f"    Falling back to original image")
+        return image_path
+
 
 def extract_text_with_vision_ocr(pdf_path):
     """Extract text from PDF using Vision OCR on rendered images"""
@@ -60,6 +216,49 @@ def extract_text_with_vision_ocr(pdf_path):
                 image = Quartz.CGBitmapContextCreateImage(context)
 
                 if image:
+                    # For preprocessing, we need to save the image to a temp file,
+                    # preprocess it, and load it back
+                    temp_path = None
+                    preprocessed_path = None
+
+                    try:
+                        if PREPROCESSING_AVAILABLE:
+                            # Save rendered page to temp file
+                            import tempfile
+                            temp_fd, temp_path = tempfile.mkstemp(suffix='.png')
+                            os.close(temp_fd)
+
+                            # Save CGImage to file
+                            temp_url = NSURL.fileURLWithPath_(temp_path)
+                            dest = Quartz.CGImageDestinationCreateWithURL(temp_url, "public.png", 1, None)
+                            if dest:
+                                Quartz.CGImageDestinationAddImage(dest, image, None)
+                                Quartz.CGImageDestinationFinalize(dest)
+
+                                # Preprocess the image
+                                preprocessed_path = preprocess_image(temp_path)
+
+                                # Load preprocessed image
+                                preprocessed_url = NSURL.fileURLWithPath_(preprocessed_path)
+                                preprocessed_image_source = Quartz.CGImageSourceCreateWithURL(preprocessed_url, None)
+                                if preprocessed_image_source:
+                                    image = Quartz.CGImageSourceCreateImageAtIndex(preprocessed_image_source, 0, None)
+                    except Exception as e:
+                        print(f"    Warning: PDF preprocessing failed: {e}")
+                        # Continue with original image
+                    finally:
+                        # Clean up temp files
+                        if temp_path and os.path.exists(temp_path):
+                            try:
+                                os.remove(temp_path)
+                            except:
+                                pass
+                        if preprocessed_path and preprocessed_path != temp_path and os.path.exists(preprocessed_path):
+                            try:
+                                os.remove(preprocessed_path)
+                            except:
+                                pass
+
                     # Create Vision request
                     request = VNRecognizeTextRequest.alloc().init()
                     request.setRecognitionLevel_(1)  # Accurate mode
@@ -87,12 +286,16 @@ def extract_text_with_vision_ocr(pdf_path):
 
 
 def extract_text_from_image(image_path):
-    """Extract text from image using Vision OCR"""
+    """Extract text from image using Vision OCR with preprocessing"""
+    preprocessed_path = None
     try:
         from Vision import VNRecognizeTextRequest, VNImageRequestHandler
         from Foundation import NSURL
 
-        image_url = NSURL.fileURLWithPath_(image_path)
+        # Preprocess the image to improve OCR accuracy
+        preprocessed_path = preprocess_image(image_path)
+
+        image_url = NSURL.fileURLWithPath_(preprocessed_path)
 
         # Create Vision request
         request = VNRecognizeTextRequest.alloc().init()
@@ -111,12 +314,30 @@ def extract_text_from_image(image_path):
                     candidates = observation.topCandidates_(1)
                     if candidates and len(candidates) > 0:
                         text_lines.append(candidates[0].string())
-                return "\n".join(text_lines)
+                result = "\n".join(text_lines)
+
+                # Clean up preprocessed temp file if it was created
+                if preprocessed_path and preprocessed_path != image_path and os.path.exists(preprocessed_path):
+                    os.remove(preprocessed_path)
+
+                return result
+
+        # Clean up preprocessed temp file if it was created
+        if preprocessed_path and preprocessed_path != image_path and os.path.exists(preprocessed_path):
+            os.remove(preprocessed_path)
 
         return ""
 
     except Exception as e:
         print(f"Vision OCR error: {e}")
+
+        # Clean up preprocessed temp file if it was created
+        if preprocessed_path and preprocessed_path != image_path and os.path.exists(preprocessed_path):
+            try:
+                os.remove(preprocessed_path)
+            except:
+                pass
+
         return ""
 
 
